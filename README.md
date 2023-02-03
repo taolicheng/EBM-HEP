@@ -2,4 +2,4 @@
 
 ## Enegy-based probabilistic modeling of high-energy events
 
-(to appear soon in Jan. 2023)
+Code repository for ["Versatile Energy-Based Models for High Energy Physics"](https://arxiv.org/abs/2302.00695), Taoli Cheng, Aaron Courville. 
