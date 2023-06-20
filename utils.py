@@ -204,7 +204,17 @@ def plot_jet_image(jets, ax, cmap="Blues"):
     
     ax.set_xlabel(r"$\eta$")
     ax.set_ylabel(r"$\phi$")
-                
+
+def calc_js_div(real, gen, plot_range=[200, 1000]):
+    prob_gen = torch.histc(gen, bins=50, min=plot_range[0], max=plot_range[1])
+    prob_gen = prob_gen / prob_gen.sum()
+    prob_real = torch.histc(real, bins=50, min=plot_range[0], max=plot_range[1])
+    prob_real = prob_real / prob_real.sum()
+
+    prob_mean = (prob_real + prob_gen) / 2.0
+    js_div = (F.kl_div(torch.log(prob_mean), prob_real) + F.kl_div(torch.log(prob_mean), prob_gen)) / 2.0
+    return js_div    
+    
 class LitProgressBar(TQDMProgressBar):
     def on_train_epoch_start(self, trainer, pl_module):
         if trainer.current_epoch:

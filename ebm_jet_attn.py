@@ -1,9 +1,6 @@
 #!/usr/bin/env python
 
-from ebm_preamble import *
-
-groomer = None
-dump_number_of_nodes = False 
+from ebm_preamble import * 
 
 FLAGS = {
         'max_len': 10000,
@@ -13,9 +10,6 @@ FLAGS = {
         'val_steps': 128,
         'scaled': False # Input feature scaling
         }
-
-def kl_divergence():
-    kl = F.kl_div(a, b)
 
 def random_sample(n_sample, n_consti):
     if FLAGS['scaled']:
@@ -33,7 +27,6 @@ def random_sample(n_sample, n_consti):
     return rand_jets
 
 class Sampler:
-
     def __init__(self, model, jet_shape, sample_size, max_len=FLAGS['max_len'], kl=False, hmc=False, epsilon=0.005, return_grad=False):
         super().__init__()
         self.model = model
@@ -67,23 +60,24 @@ class Sampler:
         
     @staticmethod
     def generate_samples(model, inp_jets, steps=60, step_size=10, return_jet_per_step=False, return_grad=False, kl=False, hmc=False, epsilon=0.005):
+        
         if hmc:
             if return_jet_per_step:
-                im_neg, im_samples, x_grad, v = gen_hmc_samples(model, inp_jets, steps, step_size, sample=True)
+                im_neg, im_samples, x_grad, v = gen_hmc_samples(model, inp_jets, steps, step_size, sample=True, mh=FLAGS['MH'])
                 return im_samples, v
             else:
-                im_neg, x_grad, v = gen_hmc_samples(model, inp_jets, steps, step_size)
+                im_neg, x_grad, v = gen_hmc_samples(model, inp_jets, steps, step_size, sample=False, mh=FLAGS['MH'])
                 return im_neg, x_grad, v
         else:
             is_training = model.training
             model.eval()
             for p in model.parameters():
                 p.requires_grad = False
-                
-            inp_jets.requires_grad = True
-
+        
             had_gradients_enabled = torch.is_grad_enabled()
-            torch.set_grad_enabled(True)
+            torch.set_grad_enabled(True)    
+            
+            inp_jets.requires_grad = True
 
             noise = torch.randn(inp_jets.shape, device=inp_jets.device)
 
@@ -97,25 +91,16 @@ class Sampler:
                 noise.normal_(0, epsilon)
                 inp_jets.data.add_(noise.data)
 
-                out_jets = - model(inp_jets.float())
-                
-                if FLAGS['singlestep']:
-                    out_jets.sum().backward()
-                    
-                    inp_jets.data.add_(-step_size * inp_jets.grad.data)
-                    
-                    grad_norm += inp_jets.grad.data.norm(dim=1)
-                    
-                    inp_jets.grad.detach_()
-                    inp_jets.grad.zero_()
+                out_jets = - model.forward(inp_jets.float())
+
+                if kl and not FLAGS['singlestep']:
+                    x_grad = torch.autograd.grad([out_jets.sum()], [inp_jets], create_graph=True)[0]
                 else:
-                    if kl:
-                        x_grad = torch.autograd.grad([out_jets.sum()], [inp_jets], create_graph=True)[0]
-                    else:
-                        x_grad = torch.autograd.grad([out_jets.sum()], [inp_jets])[0]   
-                    inp_jets = inp_jets - step_size * x_grad
-                    
-                    grad_norm += x_grad.norm(dim=1)
+                    x_grad = torch.autograd.grad([out_jets.sum()], [inp_jets])[0]
+
+                inp_jets = inp_jets - step_size * x_grad
+
+                grad_norm += x_grad.norm(dim=1)
 
                 if return_jet_per_step:
                     jets_per_step.append(inp_jets.clone().detach())
@@ -134,7 +119,6 @@ class Sampler:
             for p in model.parameters():
                 p.requires_grad = True
             model.train(is_training)
-
             torch.set_grad_enabled(had_gradients_enabled)
 
             if return_grad:
@@ -146,14 +130,11 @@ class Sampler:
                 return torch.stack(jets_per_step, dim=0), grad_norm
             else:
                 return inp_jets, inp_jets_kl, grad_norm
-
     
 class DeepEnergyModel(pl.LightningModule):
-
-    def __init__(self, jet_shape, batch_size, steps=60, step_size=10, kl=False, repel_im=False, hmc=False, epsilon=0.005, alpha=0.1, lr=1e-4, beta1=0.0, **net_args):
+    def __init__(self, jet_shape, batch_size, steps=60, step_size=10, kl=False, repel=False, hmc=False, epsilon=0.005, alpha=0.1, lr=1e-4, beta1=0.0, **net_args):
         super().__init__()
         self.save_hyperparameters()
-        self.save_hyperparameters("step_size")
         
         self.jet_shape = jet_shape
         self.batch_size = batch_size
@@ -173,9 +154,11 @@ class DeepEnergyModel(pl.LightningModule):
         return [optimizer], [scheduler]
 
     def training_step(self, batch, batch_idx):
+        self.train()
+        
         real_jets = batch
         small_noise = torch.randn_like(real_jets) * self.epsilon
-        real_jets.add_(small_noise)
+        real_jets = real_jets + small_noise
         
         if self.hparams.hmc:
             fake_jets, x_grad, v = self.sampler.sample_new_exmps(steps=self.hparams.steps, step_size=self.hparams.step_size)
@@ -205,12 +188,10 @@ class DeepEnergyModel(pl.LightningModule):
             self.net.requires_grad_(True)
             loss = loss +  loss_kl.mean()
 
-            if self.hparams.repel_im:
-                start = datetime.datetime.now()
-                
+            if self.hparams.repel:                
                 bs = fake_jets_kl.size(0)
 
-                im_flat = fake_jets_kl.view(bs, -1)
+                fake_jets_flat = fake_jets_kl.view(bs, -1)
 
                 if len(self.sampler.examples) > 1000:
                     compare_batch = torch.cat(random.choices(self.sampler.examples, k=100), dim=0)
@@ -218,18 +199,17 @@ class DeepEnergyModel(pl.LightningModule):
                     compare_batch = torch.Tensor(compare_batch).cuda(0)
                     compare_flat = compare_batch.view(100, -1)
 
-                    dist_matrix = torch.norm(im_flat[:, None, :] - compare_flat[None, :, :], p=2, dim=-1)
+                    dist_matrix = torch.norm(fake_jets_flat[:, None, :] - compare_flat[None, :, :], p=2, dim=-1)
                     loss_repel = torch.log(dist_matrix.min(dim=1)[0]).mean()
                     
                     loss = loss - 0.3 * loss_repel
                 else:
                     loss_repel = torch.zeros(1)
-
-                end = datetime.datetime.now()
             else:
                 loss_repel = torch.zeros(1)   
         else:
             loss_kl = torch.zeros(1)
+            loss_repel = torch.zeros(1) 
         
         self.log('loss', loss)
         self.log('loss_reg', reg_loss)
@@ -244,6 +224,8 @@ class DeepEnergyModel(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
+        self.eval()
+        
         jets, labels = batch
         batch_size = len(labels)
         
@@ -271,8 +253,6 @@ class DeepEnergyModel(pl.LightningModule):
         self.log('val_auc_top', auc, prog_bar=True)
         self.log('hp_metric', auc)
         
-        self.eval()
-        n_consti = self.hparams["jet_shape"][0] // 3
         init_samples = random_sample(batch_size, n_consti).to(self.device)
         
         torch.set_grad_enabled(True)
@@ -282,8 +262,6 @@ class DeepEnergyModel(pl.LightningModule):
         else:
             gen_samples, _, _ =  self.sampler.generate_samples(self.net, init_samples, steps=FLAGS['val_steps'], step_size=self.hparams.step_size, kl=False, hmc=False) # turn off KL for saving memory and faster generation
         torch.set_grad_enabled(False)
-        
-        self.train()
                 
         gen_out = self.net(gen_samples)
         cdiv_gen = gen_out.mean() - qcd_out.mean()
@@ -298,15 +276,9 @@ class DeepEnergyModel(pl.LightningModule):
         real_pts = list(map(jet_pt, qcd))
         real_pts = torch.tensor(real_pts)
         
-        prob_gen_pts = torch.histc(gen_pts, bins=50, min=200, max=1000)
-        prob_gen_pts = prob_gen_pts / prob_gen_pts.sum()
-        prob_real_pts = torch.histc(real_pts, bins=50, min=200, max=1000)
-        prob_real_pts = prob_real_pts / prob_real_pts.sum()
-
-        prob_mean = (prob_real_pts + prob_gen_pts) / 2.0
-        kl_pt = (F.kl_div(torch.log(prob_mean), prob_real_pts) + F.kl_div(torch.log(prob_mean), prob_gen_pts)) / 2.0
+        js_pt = calc_js_div(real_pts, gen_pts, plot_range=[200, 1000])
         
-        self.log('val_KL_pt', kl_pt, prog_bar=True)
+        self.log('val_JS_pt', js_pt, prog_bar=True)
         
         gen_ms = list(map(jet_mass, gen_samples))
         gen_ms = torch.tensor(gen_ms)
@@ -314,17 +286,11 @@ class DeepEnergyModel(pl.LightningModule):
         real_ms = list(map(jet_mass, qcd))
         real_ms = torch.tensor(real_ms)
         
-        prob_gen_ms = torch.histc(gen_ms, bins=50, min=0, max=500)
-        prob_gen_ms = prob_gen_ms / prob_gen_ms.sum()
-        prob_real_ms = torch.histc(real_ms, bins=50, min=0, max=500)
-        prob_real_ms = prob_real_ms / prob_real_ms.sum()
-
-        prob_mean = (prob_real_ms + prob_gen_ms) / 2.0
-        kl_m = (F.kl_div(torch.log(prob_mean), prob_real_ms) + F.kl_div(torch.log(prob_mean), prob_gen_ms)) / 2.0
+        js_m = calc_js_div(real_ms, gen_ms, plot_range=[0, 500])
         
-        self.log('val_KL_m', kl_m, prog_bar=True)
+        self.log('val_JS_m', js_m, prog_bar=True)
 
-        self.log('val_KL_avg', (kl_pt + kl_m)/2.0, prog_bar=True)
+        self.log('val_JS_avg', (js_pt + js_m)/2.0, prog_bar=True)
         
     def get_progress_bar_dict(self):
         tqdm_dict = super().get_progress_bar_dict()
@@ -341,38 +307,43 @@ def train_model(train_loader, val_loader, model_name, epochs, **kwargs):
                          #accelerator="ddp",
                          max_epochs=epochs,
                          gradient_clip_val=0.1,
-                         callbacks=[ModelCheckpoint(save_weights_only=True, mode="min", monitor='val_KL_avg'),
+                         callbacks=[ModelCheckpoint(save_weights_only=True, mode="min", monitor='val_JS_avg'),
                                     PeriodicCheckpoint(interval=len(train_loader), save_weights_only=True),
                                     LitProgressBar(),
                                     LearningRateMonitor("epoch")
                                    ])
     
-    #pl.seed_everything(42)
     model = DeepEnergyModel(**kwargs)
-    
-    # Multiple GPUs
-    #model= nn.DataParallel(model)
-    #model.to(device)
     
     trainer.fit(model, train_loader, val_loader)
     model = DeepEnergyModel.load_from_checkpoint(trainer.checkpoint_callback.best_model_path)
     
     return model           
 
-def eval_ood(model, train, test):
-    from sklearn.metrics import roc_auc_score
-    with torch.no_grad():
-        model.to(device)
-        train = torch.Tensor(train).to(device)
-        train_out = model.net(train)
+def eval_ood(model, train_loader, test_loader):
+    model.to(device)
+    model.eval()
     
-        test = torch.Tensor(test).to(device)
-        test_out = model.net(test)
-        y_true = torch.cat((torch.zeros_like(train), torch.ones_like(test)))
-        y_pred = torch.cat((-train_out, -test_out))
-        auc = roc_auc_score(y_true.cpu().numpy(), y_pred.cpu().numpy())        
-        print(f"Test AUC: {auc:4.3f}")
-        return auc
+    with torch.no_grad():
+        
+        train_energy = []
+        test_energy = []
+        
+        for train_imgs in train_loader:
+            train_imgs = train_imgs.to(model.device)
+            train_energy.append(model.net(train_imgs.float()))
+    
+        for test_imgs in test_loader:
+            test_imgs = test_imgs.to(model.device)
+            test_energy.append(model.net(test_imgs.float()))
+        
+        train_energy = torch.concat(train_energy)
+        test_energy = torch.concat(test_energy)
+        
+        y_true = np.concatenate((np.zeros_like(train_energy), np.ones_like(test_energy)))
+        y_pred = np.concatenate((-train_energy, -test_energy))
+        auc = roc_auc_score(y_true, y_pred)        
+        print(f"Test AUC: {auc:4.3f}")    
 
 def main():
     parser = argparse.ArgumentParser()
@@ -385,8 +356,8 @@ def main():
     parser.add_argument('--steps', type=int, default=128)
     parser.add_argument('--step_size', type=float, default=1.0)
     parser.add_argument('--epsilon', type=float, default=0.005)
-    parser.add_argument('--kl', action='store_true') # Add KL term for improved training or not
-    parser.add_argument('--repel_im', action='store_true')
+    parser.add_argument('--kl', action='store_true')
+    parser.add_argument('--repel', action='store_true')
     parser.add_argument('--hmc', action='store_true')
 
     # Training
@@ -406,16 +377,15 @@ def main():
     
     train_set, scaler = load_attn_train(n_train=args.n_train, input_dim=args.input_dim, scale=args.input_scaler, topref=args.topref)
     
-    test_fn = os.environ['VAE_DIR'] + 'h3_m174_h80_01_preprocessed.h5'
-    test_set = load_attn_test(scaler, test_fn, input_dim=args.input_dim, scale=args.input_scaler)
-    
     val_X, val_y = load_attn_val(scaler, n_val=10000, input_dim=args.input_dim, scale=args.input_scaler, topref=args.topref)
         
     train_loader = data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True)
     val_loader = data.DataLoader([[val_X[i], val_y[i]] for i in range(len(val_X))], batch_size=args.batch_size, shuffle=False,  drop_last=True, num_workers=2, pin_memory=True)
-    
-    test_loader  = data.DataLoader(test_set,  batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=2)
 
+    test_fn = os.environ['VAE_DIR'] + 'h3_m174_h80_01_preprocessed.h5'
+    test_set = load_attn_test(scaler, test_fn, input_dim=args.input_dim, scale=args.input_scaler)
+    test_loader  = data.DataLoader(test_set,  batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=2)    
+    
     if args.mode == "train":
             
         if args.model_name is None:
@@ -444,28 +414,27 @@ def main():
                             dff=1024,
                             rate=0.1,
                             kl=args.kl,
-                            repel_im=args.repel_im,
+                            repel=args.repel,
                             hmc=args.hmc,
                             epsilon=args.epsilon
                            )
         
         torch.save(model.state_dict(), model_path)
 
-        test_data = data(input_dim=160)
-        _, bkg, sig1, sig2 = test_data.load()
+        eval_ood(model, train_loader, test_loader)
         
-        eval_ood(model, bkg, sig1)
-        eval_ood(model, bkg, sig2)
-                
     elif args.mode == "test":
-        assert model_name != None
-        model = torch.load(model_name)
-
-        test_data = data(input_dim=160)
-        _, bkg, sig1, sig2 = test_data.load()
+        model = DeepEnergyModel(img_shape=(args.input_dim // 4 * 3,),
+                            batch_size=train_loader.batch_size,
+                            lr=args.lr,
+                            beta1=0.0,
+                            step_size=args.step_size
+                               )
+        model.load_state_dict(torch.load('models/'+model_name))
         
-        eval_ood(model, bkg, sig1)
-        eval_ood(model, bkg, sig2)
+        eval_ood(model, train_loader, test_loader)
+    
+    return model
 
 
 if __name__ == "__main__":

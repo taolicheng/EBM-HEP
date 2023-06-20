@@ -7,15 +7,18 @@ def energy_wrapper(nenergy):
     energy = - nenergy
     return energy
 
+# Partially based on code from Yilun Du, Improved Contrastive Divergence Training of Energy Based Models.
+# https://github.com/yilundu/improved_contrastive_divergence
 def hamiltonian(x, v, model):
     energy = 0.5 * torch.pow(v, 2).sum(dim=1) + energy_wrapper(model.forward(x).squeeze())
     return energy
 
-def leapfrog_step(x, v, model, step_size, num_steps, sample=False, mh=FLAGS['MH']):
+def leapfrog_step(x, v, model, step_size, num_steps, sample=False, mh=True):
     x0 = x
     v0 = v
     
     x.requires_grad_(requires_grad=True)
+    
     energy = energy_wrapper(model.forward(x))
     x_grad = torch.autograd.grad([energy.sum()], [x])[0]
     v = v - 0.5 * step_size * x_grad
@@ -48,21 +51,23 @@ def leapfrog_step(x, v, model, step_size, num_steps, sample=False, mh=FLAGS['MH'
         x = accept * x + (1 - accept) * x0
         v = accept * v + (1 - accept) * v0
         x_grad = accept * x_grad
+        
     if sample:
         return x, torch.stack(x_negs, dim=0), v, x_grad
     else:
         return x, v, x_grad
 
-def gen_hmc_samples(model, x_neg, num_steps, step_size, sample=False):
+def gen_hmc_samples(model, x_neg, num_steps, step_size, sample=False, mh=True):
 
     v = 0.001 * torch.randn_like(x_neg)
 
     if sample:
-        x_neg, x_negs, v, x_grad = leapfrog_step(x_neg, v, model, step_size, num_steps, sample=sample)
+        x_neg, x_negs, v, x_grad = leapfrog_step(x_neg, v, model, step_size, num_steps, sample=sample, mh=mh)
         return x_neg, x_negs, x_grad, v
     else:
-        x_neg, v, x_grad = leapfrog_step(x_neg, v, model, step_size, num_steps, sample=sample)
+        x_neg, v, x_grad = leapfrog_step(x_neg, v, model, step_size, num_steps, sample=sample, mh=mh)
         return x_neg, x_grad, v 
+####
     
 def MH_accept(model, x0, x1):
     '''

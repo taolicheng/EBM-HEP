@@ -11,35 +11,8 @@ import torch.nn.functional as F
 
 import uproot_methods
 from utils import jet_e, jet_pt, jet_mass
-from numpy import inf
+from math import inf
 
-class data():
-    def __init__(self, n_train=10000, input_dim=160, scale=False):
-        self.n_train = n_train
-        self.input_dim = input_dim
-        self.scale = scale
-        self.val_fn = os.environ['CLFAD_DIR'] + 'qcd_pt600_preprocessed.h5'
-        self.test1_fn = os.environ['CLFAD_DIR'] + 'top_pt600_preprocessed.h5'
-        self.test2_fn = os.environ['VAE_DIR'] + 'h3_m174_h80_01_preprocessed.h5'
-                
-        
-    def load(self):
-        train_set, scaler = load_attn_train(n_train=self.n_train, input_dim=self.input_dim, scale=self.scale)           
-        val_set = load_attn_test(scaler, self.val_fn, input_dim=self.input_dim, n_test=10000, scale=self.scale)
-        test1_set = load_attn_test(scaler, self.test1_fn, input_dim=self.input_dim, n_test=10000, scale=self.scale)
-        test2_set = load_attn_test(scaler, self.test2_fn, input_dim=self.input_dim, n_test=10000, scale=self.scale)
-        
-        return train_set, val_set, test1_set, test2_set
-    
-    def obs(self):                             
-        train_jets, test_jets = self.load()
-
-        train_jets = jet_from_ptetaphi(train_jets, scaled=self.scale)
-        test_jets = jet_from_ptetaphi(test_jets, scaled=self.scale)
-
-        ms_qcd = list(map(jet_mass, train_jets))
-        ms_top = list(map(jet_mass, test_jets))
-        return ms_qcd, ms_top
 
 def load_attn_train(n_train=None, input_dim=160, scale=False, topref=False):
     

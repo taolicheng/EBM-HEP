@@ -4,7 +4,7 @@ import os
 import json
 import math
 import numpy as np
-from numpy import inf
+from math import inf
 import h5py
 import random
 import copy
@@ -39,8 +39,8 @@ import seaborn as sns
 
 import uproot_methods
 from utils import jet_e, jet_pt, jet_mass, jet_from_ptetaphi, plot_jet_image
+from utils import calc_js_div
 from utils import LitProgressBar, PeriodicCheckpoint
-from utils import ReplayBuffer
 from load_data import *
 from ebm_models import Transformer, MLPJet
 from mcmc import gen_hmc_samples
